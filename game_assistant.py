@@ -626,19 +626,30 @@ def post_key_message(hwnd, vk, down):
     return bool(user32.PostMessageW(hwnd, msg, vk, LPARAM(lparam)))
 
 
-def post_mouse_message(hwnd, x, y, button, hold=0.0):
+def post_mouse_down(hwnd, x, y, button):
     lparam = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
     ok = bool(user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, LPARAM(lparam)))
     if button == "right":
-        ok = bool(user32.PostMessageW(hwnd, WM_RBUTTONDOWN, MK_RBUTTON, LPARAM(lparam))) and ok
-        if hold > 0:
-            time.sleep(hold)
-        ok = bool(user32.PostMessageW(hwnd, WM_RBUTTONUP, 0, LPARAM(lparam))) and ok
+        ok = bool(user32.PostMessageW(
+            hwnd, WM_RBUTTONDOWN, MK_RBUTTON, LPARAM(lparam))) and ok
     else:
-        ok = bool(user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, LPARAM(lparam))) and ok
-        if hold > 0:
-            time.sleep(hold)
-        ok = bool(user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, LPARAM(lparam))) and ok
+        ok = bool(user32.PostMessageW(
+            hwnd, WM_LBUTTONDOWN, MK_LBUTTON, LPARAM(lparam))) and ok
+    return ok
+
+
+def post_mouse_up(hwnd, x, y, button):
+    lparam = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+    if button == "right":
+        return bool(user32.PostMessageW(hwnd, WM_RBUTTONUP, 0, LPARAM(lparam)))
+    return bool(user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, LPARAM(lparam)))
+
+
+def post_mouse_message(hwnd, x, y, button, hold=0.0):
+    ok = post_mouse_down(hwnd, x, y, button)
+    if hold > 0:
+        time.sleep(hold)
+    ok = post_mouse_up(hwnd, x, y, button) and ok
     return ok
 
 
@@ -923,6 +934,7 @@ class SendEngine:
         self.limit = limit
         self.pacer = pacer
         self.resume_event = clock.resume_event
+        self.last_abort = None
 
     def log(self, level, message):
         self.out.put(("log", message, level))
@@ -954,6 +966,7 @@ class SendEngine:
             self.stop_event.wait(min(remaining, 0.1))
 
     def press(self, task):
+        self.last_abort = None
         if self.pacer is None:
             return self._press_task(task)
         state = self.pacer.wait_slot(
@@ -1013,6 +1026,23 @@ class SendEngine:
         hold = float(task.get("hold", 0) or 0)
         return hold if hold > 0 else self.hold
 
+    def _hold_wait(self, seconds):
+        end = time.time() + seconds
+        while True:
+            if self.stop_event.is_set():
+                self.last_abort = "stop"
+                return False
+            if not self.resume_event.is_set():
+                self.last_abort = "pause"
+                return False
+            if self.limit is not None and self.clock.elapsed() >= self.limit:
+                self.last_abort = "deadline"
+                return False
+            remaining = end - time.time()
+            if remaining <= 0:
+                return True
+            self.stop_event.wait(min(remaining, 0.05))
+
     def _press_key(self, task):
         return self._send_vks(task["vks"], self._hold_for(task))
 
@@ -1025,7 +1055,7 @@ class SendEngine:
             for vk in modifiers:
                 ok = post_key_message(self.hwnd, vk, True) and ok
             ok = post_key_message(self.hwnd, main_vk, True) and ok
-            time.sleep(hold)
+            held = self._hold_wait(hold)
             ok = post_key_message(self.hwnd, main_vk, False) and ok
             for vk in reversed(modifiers):
                 ok = post_key_message(self.hwnd, vk, False) and ok
@@ -1033,7 +1063,7 @@ class SendEngine:
                 self.post_warned = True
                 self.log("warn", "后台消息被拒绝（游戏可能以管理员运行或被保护），"
                                  "请改用前台模拟，或用 run_admin.bat 以管理员身份运行")
-            return ok
+            return ok and held
         previous, root = self._prepare_foreground()
         if root is None:
             return False
@@ -1045,14 +1075,14 @@ class SendEngine:
             for vk in modifiers:
                 ok = send_key(vk, True) and ok
             ok = send_key(main_vk, True) and ok
-            time.sleep(hold)
+            held = self._hold_wait(hold)
             ok = send_key(main_vk, False) and ok
             for vk in reversed(modifiers):
                 ok = send_key(vk, False) and ok
             if not ok:
                 self.log("warn", "SendInput 未生效（可能被系统拦截），"
                                  "请尝试以管理员身份运行本工具")
-            return ok
+            return ok and held
         finally:
             self._restore_focus(previous)
 
@@ -1060,7 +1090,10 @@ class SendEngine:
         hold = self._hold_for(task)
         if self.mode == "background":
             self._activate_messages()
-            return post_mouse_message(self.hwnd, task["x"], task["y"], task["button"], hold)
+            ok = post_mouse_down(self.hwnd, task["x"], task["y"], task["button"])
+            held = self._hold_wait(hold)
+            ok = post_mouse_up(self.hwnd, task["x"], task["y"], task["button"]) and ok
+            return ok and held
         previous, root = self._prepare_foreground()
         if root is None:
             return False
@@ -1072,12 +1105,12 @@ class SendEngine:
             user32.SetCursorPos(point.x, point.y)
             time.sleep(0.03)
             ok = send_input_mouse(task["button"], True)
-            time.sleep(hold)
+            held = self._hold_wait(hold)
             ok = send_input_mouse(task["button"], False) and ok
             if not ok:
                 self.log("warn", "SendInput 未生效（可能被系统拦截），"
                                  "请尝试以管理员身份运行本工具")
-            return ok
+            return ok and held
         finally:
             self._restore_focus(previous)
 
@@ -1267,6 +1300,8 @@ class RunSession:
                 return "ok"
             if not self.active():
                 return "abort"
+            if engine.last_abort == "pause":
+                continue
             attempts += 1
             if attempts >= 5:
                 return "error"
@@ -2450,6 +2485,9 @@ class App(tk.Tk):
         for index, task in enumerate(self.tasks):
             if task.get("enabled", True):
                 self._set_task_status(index, "待命")
+        if any(float(task.get("hold", 0) or 0) >= 2.0 for task in runtime_tasks):
+            self.log("提示：长按任务会占用按键通道，期间其它任务会等待；"
+                     "停止/暂停会立即中断长按并松开按键", "warn")
         self._save_config()
         self.session = RunSession(hwnd, runtime_tasks, opts, self.msg_queue)
         self.running = True
