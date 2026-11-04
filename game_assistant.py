@@ -1003,6 +1003,7 @@ class SendEngine:
 
     def _press_sequence(self, task):
         hold = self._hold_for(task)
+        auto_repeat = float(task.get("hold", 0) or 0) > 0
         gap = float(task.get("seq_gap", 0.5) or 0)
         ok = True
         for index, vks in enumerate(task["vks_list"]):
@@ -1014,7 +1015,7 @@ class SendEngine:
             if not is_window(self.hwnd):
                 self.log("err", "目标窗口已失效（可能已关闭）")
                 return False
-            ok = self._send_vks(vks, hold) and ok
+            ok = self._send_vks(vks, hold, auto_repeat) and ok
         return ok
 
     def _activate_messages(self):
@@ -1026,8 +1027,9 @@ class SendEngine:
         hold = float(task.get("hold", 0) or 0)
         return hold if hold > 0 else self.hold
 
-    def _hold_wait(self, seconds):
+    def _hold_wait(self, seconds, repeat=None):
         end = time.time() + seconds
+        next_repeat = time.time() + 0.1
         while True:
             if self.stop_event.is_set():
                 self.last_abort = "stop"
@@ -1038,15 +1040,25 @@ class SendEngine:
             if self.limit is not None and self.clock.elapsed() >= self.limit:
                 self.last_abort = "deadline"
                 return False
-            remaining = end - time.time()
+            now = time.time()
+            if repeat is not None and now >= next_repeat and now < end:
+                try:
+                    repeat()
+                except Exception:
+                    pass
+                next_repeat += 0.1
+                if next_repeat <= now:
+                    next_repeat = now + 0.1
+            remaining = end - now
             if remaining <= 0:
                 return True
             self.stop_event.wait(min(remaining, 0.05))
 
     def _press_key(self, task):
-        return self._send_vks(task["vks"], self._hold_for(task))
+        auto_repeat = float(task.get("hold", 0) or 0) > 0
+        return self._send_vks(task["vks"], self._hold_for(task), auto_repeat)
 
-    def _send_vks(self, vks, hold):
+    def _send_vks(self, vks, hold, auto_repeat=False):
         main_vk = vks[-1]
         modifiers = vks[:-1]
         if self.mode == "background":
@@ -1055,7 +1067,9 @@ class SendEngine:
             for vk in modifiers:
                 ok = post_key_message(self.hwnd, vk, True) and ok
             ok = post_key_message(self.hwnd, main_vk, True) and ok
-            held = self._hold_wait(hold)
+            repeat = (lambda: post_key_message(self.hwnd, main_vk, True)) \
+                if auto_repeat else None
+            held = self._hold_wait(hold, repeat)
             ok = post_key_message(self.hwnd, main_vk, False) and ok
             for vk in reversed(modifiers):
                 ok = post_key_message(self.hwnd, vk, False) and ok
@@ -1075,7 +1089,8 @@ class SendEngine:
             for vk in modifiers:
                 ok = send_key(vk, True) and ok
             ok = send_key(main_vk, True) and ok
-            held = self._hold_wait(hold)
+            repeat = (lambda: send_key(main_vk, True)) if auto_repeat else None
+            held = self._hold_wait(hold, repeat)
             ok = send_key(main_vk, False) and ok
             for vk in reversed(modifiers):
                 ok = send_key(vk, False) and ok
@@ -2486,7 +2501,7 @@ class App(tk.Tk):
             if task.get("enabled", True):
                 self._set_task_status(index, "待命")
         if any(float(task.get("hold", 0) or 0) >= 2.0 for task in runtime_tasks):
-            self.log("提示：长按任务会占用按键通道，期间其它任务会等待；"
+            self.log("提示：长按任务会模拟按住按键（期间重复发送按下）并占用按键通道；"
                      "停止/暂停会立即中断长按并松开按键", "warn")
         self._save_config()
         self.session = RunSession(hwnd, runtime_tasks, opts, self.msg_queue)
